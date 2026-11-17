@@ -10,7 +10,7 @@ parameters, and runs on a CPU or in the browser.
 - **Small**: 4,537,291 parameters, 18 MB, waveform generator included.
 - **Fast**: about 70x real time on four CPU threads.
 - **Two voices**: F2 (female) and M2 (male), American English, 24 kHz.
-- **Runs anywhere**: PyTorch, ONNX Runtime, and ONNX Runtime Web.
+- **Runs anywhere**: PyTorch, ONNX Runtime, ONNX Runtime Web, and Core ML.
 - **Open**: code, weights, training recipe and dataset. Trained from scratch.
 
 ## Install
@@ -55,6 +55,50 @@ python -m tiny_voca.export --checkpoint weights/tiny-voca.pt --output tiny-voca.
 
 A ready file is in the weights repository as `onnx/model.onnx`. The
 [model card](https://huggingface.co/n4ze3m/tiny-voca) shows how to call it.
+
+## Core ML (Apple Neural Engine)
+
+On a Mac with Apple silicon, the model can run with Core ML.
+
+```bash
+pip install -e ".[own,coreml]"
+python -m tiny_voca.coreml \
+  --checkpoint weights/tiny-voca.pt \
+  --voice F2 \
+  --text "Hello! This is tiny voca." \
+  --output hello.wav
+```
+
+It takes the same options as `tiny_voca.infer`. Without `--output`, it plays
+the audio.
+
+The first run converts the checkpoint to three Core ML models. This takes
+about two minutes. The models are kept in `~/Library/Caches/tiny-voca/coreml`
+(or in `TINY_VOCA_CACHE`), and later runs use them. To write them to a folder
+of your choice, use `python -m tiny_voca.coreml.export --checkpoint
+weights/tiny-voca.pt --output coreml`, and then `--models coreml` in place of
+`--checkpoint`.
+
+The encoder and the decoder run on the Neural Engine in 16-bit floats. The
+vocoder runs on the GPU. The small steps between them run on the CPU.
+`python -m tiny_voca.coreml.plan --checkpoint weights/tiny-voca.pt` shows how
+much of each model runs on the Neural Engine: all of it.
+
+The first load of each model is slow, because macOS compiles it for the
+Neural Engine. Later loads take a fraction of a second.
+
+On an M4 Max, a 2-second sentence takes about 6 ms and an 11-second sentence
+about 20 ms. That is 250 to 500 times real time, and 6 to 15 times faster than
+PyTorch on four CPU threads. With the encoder and the decoder on the CPU only,
+it is about 1.7 times slower.
+
+The audio is not identical to PyTorch's sample for sample. The noise is drawn
+in a different way, and 16-bit floats move the pitch by about one cent.
+`scripts/check_coreml.py` compares the two and writes both for listening.
+
+To run without Python, use the Swift package in `swift/`. It loads the same
+models. The phonemizer is in Python only, so a small script writes the
+phonemes to a file first. See [swift/README.md](swift/README.md).
 
 ## Web demo
 
