@@ -14,3 +14,6 @@ ops/
 web/public/assets/
 web/.wrangler/
 node_modules/
+weights/
+refs/
+!assets/*.wav

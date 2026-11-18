@@ -125,7 +125,7 @@ def speak(model, text, voice, speed=1.0, pitch_shift=0.0, seed=0, pitch_range=1.
     return wave, phones, details
 
 
-def speak_text(model, text, voice, speed=1.0, pitch_shift=0.0, seed=0, pitch_range=1.0, peak=PEAK):
+def speak_text(model, text, voice, speed=1.0, pitch_shift=0.0, seed=0, pitch_range=1.0, peak=PEAK, postfilter=None):
     """Text of any length -> (float waveform tensor, phonemized utterances).
 
     The text is read sentence by sentence and the audio is joined. A text that
@@ -136,7 +136,11 @@ def speak_text(model, text, voice, speed=1.0, pitch_shift=0.0, seed=0, pitch_ran
     when no sentence could be read, ``NothingToPronounce`` says so. The audio
     is scaled down as a whole when it peaks above ``peak``, so that it can be
     saved as 16-bit samples without clipping; ``peak=None`` returns the
-    model's output as it is."""
+    model's output as it is.
+
+    ``postfilter`` is ``None`` (off) or a preset name for
+    :mod:`tiny_voca.postfilter` (``"neutral"``, ``"clean"`` or ``"strong"``).
+    """
     limit = model.config.max_tokens - 12
     waves, spoken = [], []
 
@@ -165,6 +169,11 @@ def speak_text(model, text, voice, speed=1.0, pitch_shift=0.0, seed=0, pitch_ran
     if not waves:
         raise NothingToPronounce(f"nothing in the text could be read: {ENGLISH_ONLY}")
     wave = torch.cat(waves)
+    if postfilter:
+        from . import postfilter as post
+        filtered = post.process(wave.detach().cpu().numpy(), voice=voice, preset=postfilter,
+                                peak=peak if peak is not None else 1.0)
+        wave = torch.from_numpy(filtered).to(wave)
     return (wave if peak is None else limit_peak(wave, peak)), spoken
 
 
@@ -183,6 +192,8 @@ def main():
     parser.add_argument("--frontend", choices=FRONTENDS, help="Phonemizer (default: TINY_VOCA_FRONTEND, else the one the checkpoint was trained with)")
     parser.add_argument("--allow-frontend-mismatch", action="store_true",
                         help="Speak although the checkpoint was trained on the other front end's tokens")
+    parser.add_argument("--postfilter", choices=("off", "neutral", "clean", "strong"), default="off",
+                        help="Spectral post-processing: de-hiss and a gentle tone correction (default: off)")
     args = parser.parse_args()
     import soundfile as sf
     if args.frontend:
@@ -196,13 +207,19 @@ def main():
     except NothingToPronounce:
         parser.exit(1, f"{ENGLISH_ONLY}. Nothing in the text could be read, so no file was written.\n")
     wave = limit_peak(raw)
+    if args.postfilter != "off":
+        from . import postfilter as post
+        wave = torch.from_numpy(post.process(wave.numpy(), voice=args.voice, preset=args.postfilter))
     args.output.parent.mkdir(parents=True, exist_ok=True)
     # Float samples, never above PEAK: a later conversion to 16-bit does not clip.
     sf.write(args.output, wave.numpy(), model.config.sample_rate, subtype="FLOAT")
     for phones in spoken:
         print(" ".join(phones.symbols))
     loudest = float(raw.abs().max())
-    scaled = f", scaled down to {PEAK}" if wave is not raw else ""
+    final = float(wave.abs().max())
+    scaled = f", scaled down to {final:.3f}" if final < loudest - 1e-6 else ""
+    if args.postfilter != "off":
+        scaled += f", postfilter={args.postfilter}"
     print(f"Saved {len(wave)/model.config.sample_rate:.2f}s in {len(spoken)} utterance{'s' if len(spoken) != 1 else ''}; peak={loudest:.4f}{scaled}")
 
 

@@ -40,12 +40,45 @@ python -m tiny_voca.infer \
 | `--speed` | 1.0 | Speaking rate |
 | `--pitch-shift` | 0 | Raise or lower the pitch |
 | `--pitch-range` | 1.0 | More or less pitch movement |
+| `--postfilter` | `off` | `off`, `neutral`, `smooth`, `clean`, `warm` or `strong` (see below) |
 
 Long text is fine. It is read one sentence at a time and the audio is joined.
 A text that ends without a mark gets a full stop, so the last word does not
 break off. A sentence with nothing to read, such as one in another script, is
 skipped. The output never peaks above 0.99, so it does not clip as a 16-bit
 WAV. In Python, `tiny_voca.infer.speak_text` does the same.
+
+## Post-processing
+
+`--postfilter clean` runs an inference-only spectral filter: a gentle
+voice-specific tone correction, a de-hiss stage for pauses, a 55 Hz high-pass
+and a true-peak limiter. Presets are `neutral` (high-pass + limiter only),
+`smooth` (HF de-sizzle), `clean`, `warm` (adds a measured 180-700 Hz body
+boost) and `strong` (more noise removal). It can also be applied to an existing 24 kHz file:
+
+```bash
+python -m tiny_voca.postfilter --input raw.wav --output clean.wav --voice F2 --preset clean
+```
+
+For a less dry, more "recorded" result, `tiny_voca.humanize` adds a quiet room
+tone, sparse early reflections, occasional breaths and a gentle slow expander:
+
+```bash
+python -m tiny_voca.humanize --input raw.wav --output human.wav --voice F2 --preset human
+```
+
+The filter was tuned on the validation targets. `smooth`/`warm` also raise
+high-frequency spectral contrast (`--contrast`, default 1.5) to remove the
+broadband HF sizzle the model inherits from its target. The filter cannot fix
+prosody or timing. For F2, `--pitch-shift 0.07` brings the F0 distribution
+closer to the target. The measurements, negative results and limitations are in
+[postproc/REPORT.md](postproc/REPORT.md).
+
+On the `hf-harmonic-formant-synth` branch, `tiny-voca-hfsynth` is an
+experimental 7-12 kHz harmonic/formant rebuild, and `tiny-voca-naturalize`
+composes pitch calibration, HF synthesis, formant warp, shimmer and room into
+one naturalness chain. See [postproc/HF_SYNTH.md](postproc/HF_SYNTH.md) and
+[postproc/NATURAL.md](postproc/NATURAL.md).
 
 ## ONNX
 
