@@ -18,8 +18,9 @@ tests/
 *.pt
 *.pth
 *.wav
-# The 21 MB ONNX model and its config MUST reach the image.
+# Text assets must reach the image; the ONNX is downloaded and verified at build.
 !server/assets/**
+server/assets/model.onnx
 .env
 *.log
 .pytest_cache/

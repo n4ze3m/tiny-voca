@@ -1,0 +1,51 @@
+name: CI
+
+# A fresh clone must be enough: the 21 MB ONNX and the browser G2P are
+# gitignored, so both are restored before the tests and before the image build.
+on:
+  push:
+  pull_request:
+
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Restore the gitignored Arabic model
+        run: python scripts/fetch_model.py
+
+      - name: Restore the gitignored browser G2P asset
+        run: |
+          mkdir -p web/public/assets
+          cp src/tiny_voca/arabic_text.py web/public/assets/arabic_text.py
+
+      - name: Install dependencies (CPU torch)
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
+          python -m pip install -e ".[voice-service]"
+
+      - name: Download the CALIMA MSA database
+        run: camel_data -i defaults
+
+      - name: Run the full test suite
+        run: python -m unittest discover -s tests
+        env:
+          PYTHONIOENCODING: utf-8
+
+  image:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - name: Build the API image from a clean checkout
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: false
+          tags: tiny-voca-ar-api:ci

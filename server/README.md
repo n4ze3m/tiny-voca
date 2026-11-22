@@ -27,17 +27,20 @@ camel_data -i defaults          # CALIMA MSA database, once, at image build time
 `camel_data -i defaults` writes the morphology database to the user data
 directory. Run it once when building the image, not at every start.
 
-Copy the three model assets if they are not already present:
+On a fresh clone the 21 MB ONNX is **not** present (`*.onnx` is gitignored).
+Restore the pinned release artefact with a SHA-256 check:
 
 ```powershell
-New-Item -ItemType Directory -Path server\assets -Force | Out-Null
-Copy-Item runs\ar-halabi-f2\tiny-voca-ar.onnx server\assets\model.onnx -Force
-Copy-Item runs\ar-halabi-f2\tiny-voca-ar.json server\assets\config.json -Force
-Copy-Item src\tiny_voca\arabic_text.py server\assets\arabic_text.py -Force
+python scripts\fetch_model.py
 ```
 
-The `.gitignore` keeps these heavy files out of git; the release
-`v0.1-ar-demo-kit` contains the same model.
+`config.json` and `arabic_text.py` are versioned. The Docker build and GitHub
+Actions run the same script, so no local file is ever required. To use your own
+locally trained model instead:
+
+```powershell
+Copy-Item runs\ar-halabi-f2\tiny-voca-ar.onnx server\assets\model.onnx -Force
+```
 
 ## 2. Production stack (Docker + Ollama) — recommended
 
@@ -202,7 +205,12 @@ python -m unittest discover -s tests         # full suite
 ```
 
 The tests exercise the real ONNX model and CAMeL Tools but replace the LLM
-with a stand-in: they need neither network nor API key.
+with a stand-in: they need neither network nor API key (apart from the one-time
+model download above).
+
+`.github/workflows/ci.yml` runs this exact suite on every push and pull request,
+then builds the API image from a clean checkout — including the verified model
+download. A green CI means a fresh clone is deployable.
 
 ## 7. Production notes
 

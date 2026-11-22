@@ -23,8 +23,14 @@ RUN pip install --no-cache-dir \
       "numpy>=1.24,<3" \
       "camel-tools>=1.6,<2"
 
-# The ONNX model, its config, the G2P file and the chat page are shipped in server/.
+# Config, G2P and chat page are versioned; the 21 MB ONNX is not (git ignores
+# *.onnx), so fetch the pinned release artefact and verify its SHA-256 here.
+COPY scripts/fetch_model.py ./scripts/fetch_model.py
 COPY server/ ./server/
+ARG MODEL_URL=https://github.com/BenkadourKhaled/tiny-voca/releases/download/v0.1-ar-demo-kit/tiny-voca-ar-demo-kit.zip
+ARG MODEL_SHA256=121d285ce938dab1b3720f77ed02121d80f83ae2ec23d33ec13e095f321390d4
+RUN python scripts/fetch_model.py --url "$MODEL_URL" --sha256 "$MODEL_SHA256" \
+      --out server/assets/model.onnx
 
 RUN useradd --create-home --shell /bin/bash appuser \
  && chown -R appuser:appuser /app
