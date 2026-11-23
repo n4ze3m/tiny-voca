@@ -28,7 +28,9 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
-          python -m pip install -e ".[voice-service]"
+          # torch.onnx.export (test_export) needs the `onnx` package, which is
+          # not a runtime dependency of the service. Mirror the root README.
+          python -m pip install -e ".[voice-service]" onnx onnxruntime
 
       - name: Download the CALIMA MSA database
         run: camel_data -i defaults
