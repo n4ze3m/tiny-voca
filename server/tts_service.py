@@ -6,6 +6,7 @@ Endpoints:
     GET  /health              model metadata and attribution
     POST /api/tts             text -> WAV (browser/mobile simple path)
     POST /api/voice/answer    question -> LLM -> diacritised -> WAV
+    POST /api/voice/answer/stream  same, but one WAV per sentence (NDJSON)
 
 The ONNX session is created once, protected by a lock, and never reloaded per
 request. The model and G2P are served from ``server/assets``; no remote
@@ -14,6 +15,7 @@ repository is contacted at inference time.
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import importlib.util
 import io
@@ -29,10 +31,16 @@ import numpy as np
 import onnxruntime as ort
 import soundfile as sf
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import FileResponse, Response
+from fastapi.responses import FileResponse, Response, StreamingResponse
 from pydantic import BaseModel, Field
 
-from .answer import cut_at_sentence, generate_answer, sanitize
+from .answer import (
+    cut_at_sentence,
+    generate_answer,
+    iter_answer_deltas,
+    iter_sentences,
+    sanitize,
+)
 from .diacritize import vocalize
 
 DEFAULT_ASSETS = Path(__file__).resolve().parent / "assets"
@@ -114,6 +122,16 @@ class VoiceEngine:
 
 _engine = None
 _answer_cache: dict[str, tuple[str, bytes]] = {}
+_stream_cache: dict[str, tuple[list[tuple[str, bytes]], str]] = {}
+
+
+def _answer_key(body) -> str:
+    """One cache identity for both endpoints (model, question, options, history)."""
+    return hashlib.sha256(
+        f"{get_engine().model}|{body.question.strip()}|{body.max_chars}|{body.voice}|"
+        f"{body.speed}|{body.pitch_range}|"
+        f"{json.dumps(body.history, ensure_ascii=False, sort_keys=True)}".encode("utf-8")
+    ).hexdigest()
 
 
 def get_engine() -> VoiceEngine:
@@ -141,6 +159,11 @@ class AnswerIn(BaseModel):
     speed: float = Field(0.95, ge=0.25, le=4)
     pitch_range: float = Field(1.35, ge=0, le=3)
     max_chars: int = Field(300, ge=40, le=600)
+
+
+class StreamAnswerIn(AnswerIn):
+    """Streaming variant: how many characters per synthesized audio chunk."""
+    chunk_chars: int = Field(220, ge=40, le=600)
 
 
 @app.get("/app", response_class=FileResponse, include_in_schema=False)
@@ -191,11 +214,7 @@ def voice_answer(body: AnswerIn):
     if not question:
         raise HTTPException(400, "question must not be empty")
 
-    key = hashlib.sha256(
-        f"{engine.model}|{question}|{body.max_chars}|{body.voice}|"
-        f"{body.speed}|{body.pitch_range}|"
-        f"{json.dumps(body.history, ensure_ascii=False, sort_keys=True)}".encode("utf-8")
-    ).hexdigest()
+    key = _answer_key(body)
     cached = _answer_cache.get(key)
     if cached is None:
         try:
@@ -223,4 +242,89 @@ def voice_answer(body: AnswerIn):
         audio,
         media_type="audio/wav",
         headers={"X-Answer-Text": quote(answer, safe="")},
+    )
+
+
+def _ndjson(event: dict) -> str:
+    """One JSON object per line; Arabic stays readable in the wire format."""
+    return json.dumps(event, ensure_ascii=False) + "\n"
+
+
+@app.post("/api/voice/answer/stream")
+def voice_answer_stream(body: StreamAnswerIn):
+    """Progressive variant: emit one 16-bit PCM WAV per finished sentence.
+
+    The LLM still generates the full answer (and ``qwen2.5:14b`` is unchanged),
+    but each sentence is diacritized and synthesized as soon as it arrives.
+    The client reads newline-delimited JSON:
+
+        {"part": 1, "text": "...", "audio": "<base64 WAV>"}
+        ...
+        {"done": true, "text": "<full answer>", "parts": 2}
+
+    Failures after the response has started are reported as
+    ``{"error": "...", "status": 503|504|502}`` events. The original
+    ``/api/voice/answer`` endpoint is untouched.
+    """
+    engine = get_engine()
+    engine.check_voice(body.voice)
+    question = body.question.strip()
+    if not question:
+        raise HTTPException(400, "question must not be empty")
+
+    key = _answer_key(body) + f"|chunk:{body.chunk_chars}"
+    cached = _stream_cache.get(key)
+
+    def events():
+        if cached is not None:
+            segments, full = cached
+            for part, (text, audio) in enumerate(segments, 1):
+                yield _ndjson({
+                    "part": part,
+                    "text": text,
+                    "audio": base64.b64encode(audio).decode("ascii"),
+                })
+            yield _ndjson({"done": True, "text": full, "parts": len(segments)})
+            return
+        try:
+            deltas = iter_answer_deltas(question, history=body.history)
+            segments: list[tuple[str, bytes]] = []
+            full = ""
+            for segment in iter_sentences(deltas, max_chars=body.chunk_chars):
+                text = sanitize(cut_at_sentence(segment, body.max_chars))
+                if not text:
+                    continue
+                full = (full + " " + text).strip()
+                wave = engine.synthesize(vocalize(text), body.speed, body.pitch_range)
+                audio = engine.wav_bytes(wave)
+                segments.append((text, audio))
+                yield _ndjson({
+                    "part": len(segments),
+                    "text": text,
+                    "audio": base64.b64encode(audio).decode("ascii"),
+                })
+            if not segments:
+                yield _ndjson({
+                    "error": "the answer contained nothing pronounceable", "status": 502
+                })
+                return
+            _stream_cache[key] = (segments, full)
+            yield _ndjson({"done": True, "text": full, "parts": len(segments)})
+        except RuntimeError as error:
+            yield _ndjson({"error": str(error), "status": 503})
+        except httpx.TimeoutException:
+            yield _ndjson({
+                "error": "the language model request exceeded the timeout", "status": 504
+            })
+        except engine.NothingToPronounce:
+            yield _ndjson({
+                "error": "the answer contained nothing pronounceable", "status": 502
+            })
+        except Exception as error:
+            yield _ndjson({"error": f"answer generation failed: {error}", "status": 502})
+
+    return StreamingResponse(
+        events(),
+        media_type="application/x-ndjson",
+        headers={"Cache-Control": "no-store", "X-Accel-Buffering": "no"},
     )

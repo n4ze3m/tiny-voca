@@ -11,6 +11,11 @@ client question (text)
     -> WAV reply + the answer text in a response header
 ```
 
+An optional streaming path (`POST /api/voice/answer/stream`) starts the same
+pipeline **per sentence** as soon as the LLM finishes that sentence, so the
+first audio arrives while the model is still writing. The model is unchanged
+(`qwen2.5:14b`, Apache-2.0).
+
 The service reuses the exact ONNX model and the exact G2P file of the browser
 demo (`web/public/assets/`). Nothing is downloaded at inference time. eSpeak NG
 (GPL-3.0) is **not** used and **not** shipped.
@@ -79,9 +84,32 @@ Measured on this machine (i7-12700, 32 GB RAM, Intel UHD 770, no discrete GPU):
 
 CPU inference of a 14B model is the bottleneck; the Arabic ONNX synthesis itself
 costs only ~0.3 s of CPU for 5 s of speech. Hence `TINY_VOCA_LLM_KEEP_ALIVE=-1`
-(keep the model resident) and `TINY_VOCA_LLM_TIMEOUT=120` in Compose. For a
-snappier demo, switch to `qwen2.5:7b` in both `TINY_VOCA_LLM_MODEL` and the
-`model-init` pull; on an 8 GB host it is mandatory.
+(keep the model resident) and `TINY_VOCA_LLM_TIMEOUT=120` in Compose. We kept
+`qwen2.5:14b` for answer quality: streaming hides most of the wait without
+downgrading the model. (On an 8 GB host, `qwen2.5:7b` in both
+`TINY_VOCA_LLM_MODEL` and the `model-init` pull is mandatory.)
+
+### Why streaming instead of a smaller model
+
+The chat UI now reads `POST /api/voice/answer/stream`. Ollama emits an SSE
+stream of token fragments; `server/answer.py` groups them into sentences and
+the service diacritizes + synthesizes each one immediately. The browser queues
+the audio parts so they play in order, and shows
+`جارٍ إعداد الجواب الصوتي... (1/2)` while the rest is being made. Stop and
+regenerate buttons are available. The original blocking endpoint is preserved
+for API clients and as a browser fallback.
+
+| Call | Latency (measured, warm model) |
+|---|---|
+| Full `/api/voice/answer`, ~30-word answer | ~19 s before any sound |
+| First audio part, short one-sentence answer | ~9 s (9.3 s for the whole answer) |
+| First audio part, longer two-sentence answer | ~9.5 s instead of ~24.5 s for the whole answer |
+| Later parts | emitted as each sentence completes; ~0.3 s synthesis each |
+
+These figures are CPU-only (i7-12700). Time to the first sound is dominated by
+how quickly the 14B model writes the **first sentence**; streaming removes the
+wait for the rest of the answer. The first ever request still pays the ~27 s
+model load; `keep_alive=-1` pays it only once.
 
 The API image is CPU-only (no PyTorch), runs as a non-root user, and downloads
 the CALIMA database once at **build** time. `server/assets/model.onnx` is copied
@@ -167,6 +195,7 @@ not the quality of the LLM. Stop both with `Ctrl+C`.
 | `GET` | `/health` | — | language, frontend, voices, sample rate, step, attribution |
 | `POST` | `/api/tts` | `{"text": "مَرْحَبًا بِالْعالَمِ."}` | `audio/wav` |
 | `POST` | `/api/voice/answer` | `{"question": "كيف حالك؟"}` | `audio/wav` + `X-Answer-Text` header (percent-encoded) |
+| `POST` | `/api/voice/answer/stream` | `{"question": "كيف حالك؟"}` | `application/x-ndjson`: one audio part per line, then a `done` event |
 
 `/api/tts` fields: `text`, `voice` (`F2`), `speed` (0.95), `pitch_range` (1.35),
 `already_vocalized` (`true`). The rules G2P can also read unvocalised Arabic,
@@ -178,6 +207,32 @@ CAMeL tashkeel on the text first. Text with no readable Arabic word returns 400.
 `pitch_range`, `max_chars` (300). Only the last six history turns reach the
 LLM. Repeated identical questions are served from an in-memory cache keyed by
 model, question, history, length, voice, speed and pitch range.
+
+`/api/voice/answer/stream` accepts the same fields plus `chunk_chars` (220):
+the maximum length of one synthesized sentence chunk. Each line is one JSON
+object; `audio` is a base64-encoded 24 kHz 16-bit PCM WAV:
+
+```json
+{"part": 1, "text": "عاصمة مصر هي القاهرة.", "audio": "UklGR..."}
+{"part": 2, "text": "تقع على ضفاف النيل.", "audio": "UklGR..."}
+{"done": true, "text": "عاصمة مصر هي القاهرة. تقع على ضفاف النيل.", "parts": 2}
+```
+
+On a late failure the stream emits `{"error": "...", "status": 503|504|502}`
+instead of a broken HTTP status (headers are already sent). Identical questions
+replay the cached audio parts without calling the LLM again.
+
+To watch the stream arrive in real time (`-N` disables curl buffering; each
+line is printed when the corresponding sentence has been synthesized):
+
+```powershell
+curl.exe -N -X POST "http://127.0.0.1:8000/api/voice/answer/stream" `
+  -H "Content-Type: application/json" `
+  -d '{"question":"ما عاصمة مصر؟"}'
+```
+
+In Python, use `httpx.stream(...)` and `response.iter_lines()` (a plain
+`httpx.post` waits for the whole answer and hides the latency gain).
 
 ### Try it
 
@@ -200,7 +255,8 @@ not work). `POST` with `fetch`, read the `X-Answer-Text` header with
 
 ```powershell
 $env:PYTHONIOENCODING = "utf-8"
-python -m unittest discover -s tests -p "test_voice_service.py" -v
+python -m unittest discover -s tests -p "test_answer_stream.py" -v   # SSE + chunking, no model
+python -m unittest discover -s tests -p "test_voice_service.py" -v   # real ONNX + endpoints
 python -m unittest discover -s tests         # full suite
 ```
 
@@ -228,7 +284,9 @@ download. A green CI means a fresh clone is deployable.
 - **Limits**: `max_tokens=512`, `max_chars<=600`. CAMeL tashkeel can misread
   proper names and the pronunciation follows that error.
 - **Quality**: single voice `F2`, Damascene accent, flatter prosody than the
-  reference and occasionally short audio. Not streaming, no voice cloning.
+  reference and occasionally short audio. Sentence-level streaming, no voice
+  cloning. Slight pauses can be heard between audio parts; raise `chunk_chars`
+  to 300-400 to get fewer, longer parts at the cost of a later first sound.
 - **Attribution**: all model/data derivatives come from the Arabic Speech
   Corpus (Halabi 2016), CC BY 4.0. Keep the citation in the service metadata
   and in any user-facing page: Halabi, Nawar (2016). *Modern standard Arabic

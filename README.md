@@ -22,7 +22,9 @@ The upstream English release has two voices; this repository also builds an
 - **Browser front end without eSpeak**: the Arabic demo ships a pure-Python G2P
   in Pyodide. eSpeak NG (GPL-3.0) is never embedded.
 - **Voice answers (optional HTTP service)**: text question -> LLM answer ->
-  Arabic tashkeel -> WAV voice message. See [server/README.md](server/README.md).
+  Arabic tashkeel -> WAV voice message. The chat UI streams one WAV per
+  sentence, so the first audio arrives before the LLM has finished. See
+  [server/README.md](server/README.md).
 
 One command starts the whole stack (Ollama `qwen2.5:14b`, Apache-2.0, + the API)
 with the 9 GB model in a persistent volume:
@@ -188,7 +190,7 @@ not replace one. WAV pairs for each sample are in `evaluation/ar-f2/audio/`.
 python -m unittest discover -s tests
 ```
 
-Last run on the Arabic build: **135 tests, 4 skipped, OK**.
+Last run on the Arabic build: **181 tests, 4 skipped, OK**.
 
 ## Limits
 
@@ -198,7 +200,8 @@ Last run on the Arabic build: **135 tests, 4 skipped, OK**.
 - Arabic texts must be vocalised; no reliable browser-side tashkeel.
 - English remains two fixed voices; no voice cloning.
 - Foreign names and odd spellings are often read wrong.
-- No streaming yet.
+- The voice service streams sentence by sentence; the browser demo still plays
+  pre-generated sentences (no live TTS in the browser).
 
 ## Attribution
 

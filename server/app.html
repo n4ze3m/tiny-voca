@@ -21,18 +21,20 @@
   .label { font-size:.72rem; color:#777; margin-bottom:.25rem; }
   /* Keep the answer text in the DOM (history/debug) but show voice only. */
   .bot .text { display: none; }
+  .hidden-answer { display: none; }
   audio { display:block; width:100%; margin-top:.8rem; height:54px; }
   .meta { font-size:.75rem; color:#666; margin-top:.35rem; direction:ltr; text-align:right; }
   .spinner { display:inline-block; width:.8em; height:.8em; border:2px solid #c7d2e6;
              border-top-color:var(--blue); border-radius:50%; margin-inline-end:.4rem;
              vertical-align:-1px; animation:spin .8s linear infinite; }
   @keyframes spin { to { transform:rotate(360deg); } }
-  @media (max-width:600px) { .bot { width:100%; } }
+  @media (max-width:600px) { .bot { width:100%; } #composer { flex-wrap:wrap; } }
   #composer { display:flex; gap:.6rem; position:sticky; bottom:0; background:var(--bg); padding:.8rem 0 1.2rem; }
   #question { flex:1; padding:.8rem 1rem; font-size:1rem; border:1px solid var(--line); border-radius:10px; }
   button { padding:.7rem 1.1rem; border:0; border-radius:10px; cursor:pointer; font-size:.95rem; }
   #send { background:var(--blue); color:white; }
-  #clear { background:#e6e9ef; color:#333; }
+  #regen, #clear { background:#e6e9ef; color:#333; }
+  #stop { background:#ffd9d9; color:#8a1f1f; }
   button:disabled { opacity:.55; cursor:default; }
   footer { text-align:center; color:#777; font-size:.75rem; padding:1rem; line-height:1.7; }
 </style>
@@ -48,6 +50,8 @@
     <input id="question" autocomplete="off" placeholder="اكتب سؤالك هنا..."
            value="كيف حالك اليوم؟">
     <button id="send" onclick="send()">أرسل</button>
+    <button id="regen" onclick="regenerate()" disabled>إعادة</button>
+    <button id="stop" onclick="stopStream()" disabled>إيقاف</button>
     <button id="clear" onclick="clearChat()">جديد</button>
   </div>
 </main>
@@ -59,8 +63,14 @@
 const chat = document.getElementById("chat");
 const input = document.getElementById("question");
 const sendButton = document.getElementById("send");
+const regenButton = document.getElementById("regen");
+const stopButton = document.getElementById("stop");
 let history = [];
 let busy = false;
+let controller = null;
+let audioQueue = [];
+let playingAudio = false;
+let activeAudio = null;
 
 function bubble(kind, html) {
   const div = document.createElement("div");
@@ -87,6 +97,22 @@ function formatTime(seconds) {
   return minutes + ":" + String(Math.floor(seconds % 60)).padStart(2, "0");
 }
 
+function base64ToBlob(base64) {
+  const binary = atob(base64);
+  const bytes = new Uint8Array(binary.length);
+  for (let index = 0; index < binary.length; index++) bytes[index] = binary.charCodeAt(index);
+  return new Blob([bytes], { type: "audio/wav" });
+}
+
+// Parts arrive one after another: play them in order instead of overlapping.
+function playNextAudio() {
+  if (playingAudio || audioQueue.length === 0) return;
+  const next = audioQueue.shift();
+  activeAudio = next;
+  playingAudio = true;
+  next.play().catch(() => { playingAudio = false; });   // controls stay available
+}
+
 function addBot(text, blob) {
   const div = bubble("bot", '<div class="label">رسالة صوتية</div><div class="text">' +
                      escapeHtml(text) + "</div>");
@@ -105,52 +131,155 @@ function addBot(text, blob) {
   };
   audio.addEventListener("loadedmetadata", updateProgress);
   audio.addEventListener("timeupdate", updateProgress);
-  audio.addEventListener("ended", updateProgress);
+  audio.addEventListener("ended", () => {
+    updateProgress();
+    if (activeAudio === audio) { playingAudio = false; activeAudio = null; }
+    playNextAudio();
+  });
+  audio.addEventListener("play", () => {
+    if (activeAudio && activeAudio !== audio) activeAudio.pause();
+    activeAudio = audio;
+    playingAudio = true;
+  });
   updateProgress();
-  audio.play().catch(() => {});          // the controls remain if the browser blocks autoplay
+  audioQueue.push(audio);
+  playNextAudio();
   return audio;
 }
 
-async function send() {
+function clearAudioQueue() {
+  audioQueue.forEach((audio) => audio.pause());
+  audioQueue = [];
+  if (activeAudio) activeAudio.pause();
+  activeAudio = null;
+  playingAudio = false;
+}
+
+function recordAnswer(question, answer) {
+  // The text implementation is kept: hidden in the DOM and sent back as
+  // assistant context, but never displayed (voice-only user experience).
+  const hidden = document.createElement("div");
+  hidden.className = "hidden-answer";
+  hidden.textContent = answer;
+  chat.appendChild(hidden);
+  history.push({ role: "user", content: question },
+               { role: "assistant", content: answer });
+  if (history.length > 12) history = history.slice(-12);
+}
+
+async function answerStream(question, waiting, status, signal) {
+  const response = await fetch("/api/voice/answer/stream", {
+    method: "POST",
+    signal: signal,
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ question: question, history: history })
+  });
+  if (!response.ok) {
+    let detail = "HTTP " + response.status;
+    try { detail = (await response.json()).detail || detail; } catch (error) {}
+    throw new Error(detail);
+  }
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder("utf-8");
+  let buffer = "";
+  let full = "";
+  while (true) {
+    const chunk = await reader.read();
+    if (chunk.done) break;
+    buffer += decoder.decode(chunk.value, { stream: true });
+    let newline;
+    while ((newline = buffer.indexOf("\n")) >= 0) {
+      const line = buffer.slice(0, newline).trim();
+      buffer = buffer.slice(newline + 1);
+      if (!line) continue;
+      const event = JSON.parse(line);
+      if (event.error) throw new Error(event.error);
+      if (event.part) {
+        status.textContent = "جارٍ إعداد الجواب الصوتي... (" + event.part + "/" +
+                             (event.parts || "…") + ")";
+        addBot(event.text || "", base64ToBlob(event.audio));
+      }
+      if (event.done) full = event.text || full;
+    }
+  }
+  waiting.remove();
+  recordAnswer(question, full);
+}
+
+async function answerWhole(question) {
+  // Fallback for browsers without a readable response body: the original
+  // endpoint and its X-Answer-Text header remain part of the implementation.
+  const response = await fetch("/api/voice/answer", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ question: question, history: history })
+  });
+  if (!response.ok) {
+    let detail = "HTTP " + response.status;
+    try { detail = (await response.json()).detail || detail; } catch (error) {}
+    throw new Error(detail);
+  }
+  const answer = decodeURIComponent(response.headers.get("X-Answer-Text") || "");
+  addBot(answer, await response.blob());
+  recordAnswer(question, answer);
+}
+
+async function send(questionOverride) {
   if (busy) return;
-  const question = input.value.trim();
+  const question = (questionOverride || input.value).trim();
   if (!question) return;
   busy = true;
   sendButton.disabled = true;
+  regenButton.disabled = true;
+  stopButton.disabled = false;
   input.value = "";
   addUser(question);
-  const waiting = bubble("typing", '<span class="spinner"></span>جارٍ إعداد الجواب الصوتي...');
+  const waiting = bubble("typing", '<span class="spinner"></span>' +
+                         '<span id="status">جارٍ إعداد الجواب الصوتي... (0)</span>');
+  const status = waiting.querySelector("#status");
+  controller = new AbortController();
   try {
-    const response = await fetch("/api/voice/answer", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ question: question, history: history })
-    });
-    if (!response.ok) {
-      let detail = "HTTP " + response.status;
-      try { detail = (await response.json()).detail || detail; } catch (error) {}
-      throw new Error(detail);
+    if (typeof Response.prototype.body === "undefined" || typeof TextDecoder === "undefined") {
+      await answerWhole(question);
+    } else {
+      await answerStream(question, waiting, status, controller.signal);
     }
-    const answer = decodeURIComponent(response.headers.get("X-Answer-Text") || "");
-    const audio = await response.blob();
     waiting.remove();
-    addBot(answer, audio);
-    history.push({ role: "user", content: question },
-                 { role: "assistant", content: answer });
-    if (history.length > 12) history = history.slice(-12);
   } catch (error) {
+    clearAudioQueue();
     waiting.remove();
-    bubble("error", "حدث خطأ: " + escapeHtml(error.message));
+    if (error.name === "AbortError") bubble("typing", "تم إيقاف الإجابة.");
+    else bubble("error", "حدث خطأ: " + escapeHtml(error.message));
   } finally {
     busy = false;
+    controller = null;
     sendButton.disabled = false;
+    regenButton.disabled = history.length < 2;
+    stopButton.disabled = true;
     input.focus();
   }
 }
 
+function stopStream() {
+  if (!busy || !controller) return;
+  controller.abort();                 // stops the NDJSON reader
+  clearAudioQueue();                  // stops any queued audio parts
+}
+
+function regenerate() {
+  if (busy || history.length < 2) return;
+  const previous = history[history.length - 2];
+  if (!previous || previous.role !== "user") return;
+  history = history.slice(0, -2);     // re-ask without the old answer in context
+  send(previous.content);
+}
+
 function clearChat() {
+  if (controller) controller.abort();
+  clearAudioQueue();
   chat.innerHTML = "";
   history = [];
+  regenButton.disabled = true;
   input.focus();
 }
 

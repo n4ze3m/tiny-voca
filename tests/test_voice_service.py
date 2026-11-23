@@ -4,8 +4,10 @@ The model is loaded once from ``server/assets`` (the exact browser demo model).
 The LLM is always replaced by a stand-in: no network and no API key are needed.
 """
 
+import base64
 import importlib.util
 import io
+import json
 import os
 from pathlib import Path
 import sys
@@ -152,6 +154,25 @@ class DiacritizationTests(unittest.TestCase):
         self.assertTrue(any("\u064b" <= char <= "\u065f" for char in result), result)
         self.assertIs(vocalize(plain), result)                           # lru_cache hits
 
+    def test_a_word_without_a_morphology_analysis_keeps_its_spelling(self):
+        from server import diacritize
+
+        class Analysis:
+            def __init__(self, diac):
+                self.analysis = {"diac": diac}
+
+        class Item:
+            def __init__(self, word, diac=None):
+                self.word = word
+                self.analyses = [] if diac is None else [Analysis(diac)]
+
+        fake = Mock()
+        fake.disambiguate.return_value = [Item("مارسي"), Item("الكبير", "الْكَبِير"),
+                                          Item("كلمةجديدة")]
+        with patch.object(diacritize, "_engine", return_value=fake):
+            result = diacritize.vocalize("مارسي الكبير كلمةجديدة")
+        self.assertEqual(result, "مارسي الْكَبِير كلمةجديدة")
+
 
 class VoiceEngineTests(unittest.TestCase):
     @classmethod
@@ -209,6 +230,7 @@ class EndpointTests(unittest.TestCase):
     def setUp(self):
         tts_service._engine = self.speech
         tts_service._answer_cache.clear()
+        tts_service._stream_cache.clear()
 
     def wav(self, response):
         self.assertEqual(response.status_code, 200, response.text)
@@ -224,9 +246,23 @@ class EndpointTests(unittest.TestCase):
             response = self.client.get(path)
             self.assertEqual(response.status_code, 200, path)
             self.assertIn('lang="ar" dir="rtl"', response.text)
+            # The original endpoint and its text header are kept as a fallback.
             self.assertIn('fetch("/api/voice/answer"', response.text)
+            self.assertIn('response.headers.get("X-Answer-Text")', response.text)
             self.assertIn('createElement("audio")', response.text)
             self.assertIn("history: history", response.text)
+
+    def test_demo_page_reads_the_streaming_answer(self):
+        html = self.client.get("/app").text
+        self.assertIn('fetch("/api/voice/answer/stream"', html)
+        self.assertIn("response.body.getReader()", html)
+        self.assertIn('new TextDecoder("utf-8")', html)
+        self.assertIn("event.part", html)
+        self.assertIn("event.done", html)
+        self.assertIn("event.error", html)
+        self.assertIn("base64ToBlob", html)
+        self.assertIn('id="stop"', html)
+        self.assertIn("function regenerate()", html)
 
     def test_demo_page_shows_the_answer_as_audio_only(self):
         html = self.client.get("/app").text
@@ -321,6 +357,61 @@ class EndpointTests(unittest.TestCase):
 
     def test_voice_answer_rejects_an_empty_question(self):
         self.assertEqual(self.client.post("/api/voice/answer", json={"question": "  "}).status_code, 400)
+
+    def stream_events(self, response):
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertIn("application/x-ndjson", response.headers["content-type"])
+        return [json.loads(line) for line in response.text.splitlines() if line.strip()]
+
+    def test_stream_emits_a_pcm_wav_per_sentence_then_the_full_answer(self):
+        deltas = ["عاصمة مصر هي القاهرة. ", "تقع على ضفاف النيل."]
+        turns = [{"role": "user", "content": "اسمي خالد"}]
+        with patch.object(tts_service, "iter_answer_deltas", return_value=iter(deltas)) as streamed, \
+             patch.object(tts_service, "vocalize", return_value=VOCALIZED) as vocalize:
+            response = self.client.post("/api/voice/answer/stream",
+                                        json={"question": "ما عاصمة مصر؟", "history": turns})
+        events = self.stream_events(response)
+        self.assertEqual([event["part"] for event in events if "part" in event], [1, 2])
+        self.assertEqual(events[-1]["done"], True)
+        self.assertEqual(events[-1]["parts"], 2)
+        self.assertEqual(events[-1]["text"], "عاصمة مصر هي القاهرة. تقع على ضفاف النيل.")
+        self.assertEqual(vocalize.call_count, 2)
+        self.assertEqual(streamed.call_args.args, ("ما عاصمة مصر؟",))
+        self.assertEqual(streamed.call_args.kwargs["history"], turns)
+        for event in events[:2]:
+            self.assertTrue(any("\u0600" <= char <= "\u06ff" for char in event["text"]))
+            raw = base64.b64decode(event["audio"])
+            self.assertEqual(raw[:4], b"RIFF")
+            self.assertEqual(raw[20:22], b"\x01\x00")                 # PCM, not float
+            with wave_file.open(io.BytesIO(raw)) as readable:
+                self.assertEqual(readable.getsampwidth(), 2)
+                self.assertEqual(readable.getframerate(), 24000)
+                self.assertGreater(readable.getnframes(), 0)
+
+    def test_stream_replays_a_cached_answer_without_the_llm(self):
+        deltas = ["مرحبا بك، كيف حالك؟"]
+        request = {"question": "مرحبا"}
+        with patch.object(tts_service, "iter_answer_deltas", return_value=iter(deltas)) as streamed, \
+             patch.object(tts_service, "vocalize", return_value=VOCALIZED):
+            first = self.stream_events(self.client.post("/api/voice/answer/stream", json=request))
+            second = self.stream_events(self.client.post("/api/voice/answer/stream", json=request))
+        self.assertEqual(streamed.call_count, 1)
+        self.assertEqual(first, second)
+
+    def test_stream_reports_a_missing_key_as_an_error_event(self):
+        with patch.object(tts_service, "iter_answer_deltas",
+                          side_effect=RuntimeError("TINY_VOCA_LLM_KEY is not set")):
+            events = self.stream_events(
+                self.client.post("/api/voice/answer/stream", json={"question": "مرحبا"})
+            )
+        self.assertEqual(len(events), 1)
+        self.assertIn("TINY_VOCA_LLM_KEY", events[0]["error"])
+        self.assertEqual(events[0]["status"], 503)
+        self.assertNotIn("done", events[0])
+
+    def test_stream_rejects_an_empty_question(self):
+        self.assertEqual(self.client.post("/api/voice/answer/stream",
+                                          json={"question": "  "}).status_code, 400)
 
 
 if __name__ == "__main__":

@@ -23,6 +23,18 @@ def _engine():
     return _disambiguator
 
 
+def _diacritized(item) -> str:
+    """Best diacritization for one token, with a safe fallback.
+
+    CAMeL can return an empty ``analyses`` list for a misspelled or rare word
+    (e.g. a name the LLM invented). The original spelling still pronounces
+    fine with the rules G2P, so never fail the whole answer for one token.
+    """
+    if not item.analyses:
+        return item.word
+    return item.analyses[0].analysis.get("diac") or item.word
+
+
 @lru_cache(maxsize=2000)
 def vocalize(text: str) -> str:
     """Unvocalised Arabic -> fully vocalised Arabic (best effort)."""
@@ -30,4 +42,4 @@ def vocalize(text: str) -> str:
 
     tokens = simple_word_tokenize(text)
     analysed = _engine().disambiguate(tokens)
-    return " ".join(item.analyses[0].analysis.get("diac", item.word) for item in analysed)
+    return " ".join(_diacritized(item) for item in analysed)
