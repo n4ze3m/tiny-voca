@@ -137,6 +137,7 @@ Languages and voices:
 - [tiny-voca-es](https://github.com/stdevMac/tiny-voca): Spanish from Spain, with a browser demo.
 - [alpa-es](https://huggingface.co/FranciscoCarlosErra/alpa-es): Rioplatense Spanish.
 - [tiny-voca-fr](https://github.com/DanielSuncost/tiny-voca-fr): French, with a browser demo.
+- [tiny-voca-french](https://huggingface.co/ymelka/tiny-voca-french): French, five voices, trained from scratch on 55.6 hours of speech, with a [browser demo](https://huggingface.co/spaces/ymelka/tiny-voca-french).
 - [tiny-voca-ptbr](https://github.com/SemFence/tiny-voca-ptbr): Brazilian Portuguese, with its own phonemizer.
 - [tiny-voca-ptbr-kokoro](https://github.com/Haple/tiny-voca-ptbr-kokoro): Brazilian Portuguese, with Kokoro's Brazilian voices as the teacher.
 - [tiny-broca](https://huggingface.co/brenorb/tiny-broca): Brazilian Portuguese, two voices, reads letters with no dictionary, with a [browser demo](https://tiny-broca-demo.pages.dev).
